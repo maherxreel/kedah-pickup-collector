@@ -17,8 +17,15 @@ OSRM_URL = "http://router.project-osrm.org/nearest/v1/driving/"
 # --- PART 1: GOV DATA ---
 def fetch_gov_data():
     print("--- [1/3] Starting Gov Data Fetch ---")
+    # SELF-CLEANING: Remove old file to force fresh download
     try:
-        # (Same Gov logic as before - this part is safe)
+        if os.path.exists(f"{DATA_DIR}/gov_pickups.csv"):
+            os.remove(f"{DATA_DIR}/gov_pickups.csv")
+            print("Deleted old gov_pickups.csv")
+    except:
+        pass
+
+    try:
         url = "https://api.data.gov.my/gtfs-static/mybas-alor-setar"
         r = requests.get(url)
         if r.status_code == 200:
@@ -32,13 +39,20 @@ def fetch_gov_data():
     except Exception as e:
         print(f"Gov Data Error: {e}")
 
-# --- PART 2: OVERTURE MAPS (With Safety Check) ---
+# --- PART 2: OVERTURE MAPS ---
 def fetch_overture_data():
     print("--- [2/3] Starting Overture Data Fetch ---")
+    
+    # SELF-CLEANING: Remove old file so we don't snap Thai data by accident
+    output_file = f"{DATA_DIR}/overture_pickups.csv"
+    if os.path.exists(output_file):
+        os.remove(output_file)
+        print("Deleted old overture_pickups.csv (Purging Thai data)")
+
     con = duckdb.connect()
     con.execute("INSTALL spatial; LOAD spatial; INSTALL httpfs; LOAD httpfs;")
     
-    # We use a strict BBOX in SQL
+    # STRICT ALOR SETAR BOX (6.05-6.20 Lat, 100.30-100.45 Lon)
     query = f"""
     COPY (
         SELECT 
@@ -47,7 +61,6 @@ def fetch_overture_data():
             ST_Y(geometry) AS lat, 
             ST_X(geometry) AS lon
         FROM read_parquet('s3://overturemaps-us-west-2/release/2025-11-19.0/theme=places/type=place/*', filename=true, hive_partitioning=1)
-       # UPDATED: Strict Alor Setar Box (No Thailand)
         WHERE 
             bbox.xmin > 100.30 AND bbox.xmax < 100.45
             AND bbox.ymin > 6.05 AND bbox.ymax < 6.20
@@ -56,7 +69,7 @@ def fetch_overture_data():
                 OR categories.primary LIKE '%transportation%'
                 OR categories.primary LIKE '%shopping%'
             )
-    ) TO '{DATA_DIR}/overture_pickups.csv' (HEADER, DELIMITER ',');
+    ) TO '{output_file}' (HEADER, DELIMITER ',');
     """
     try:
         con.execute(query)
@@ -65,7 +78,7 @@ def fetch_overture_data():
     except Exception as e:
         print(f"Overture Error: {e}")
 
-# --- PART 3: ROBUST SNAPPING (The Fix) ---
+# --- PART 3: SNAP TO ROAD ---
 def snap_data_to_road():
     print("--- [3/3] Starting Road Snapping ---")
     input_path = f"{DATA_DIR}/overture_pickups.csv"
@@ -77,19 +90,14 @@ def snap_data_to_road():
 
     df = pd.read_csv(input_path)
     
-    # 1. SAFETY FILTER: Delete points that are not in Kedah
-    # Kedah is approx Lat 5.0-7.0, Lon 100.0-101.5
-    original_count = len(df)
+    # SAFETY CHECK: Double verification
+    # If the file still has Thai coordinates (Lat > 6.25 or Lon > 100.5), DELETE THEM.
     df = df[
-        (df['lat'] >= 5.0) & (df['lat'] <= 7.0) & 
-        (df['lon'] >= 100.0) & (df['lon'] <= 101.5)
+        (df['lat'] > 6.0) & (df['lat'] < 6.25) & 
+        (df['lon'] > 100.2) & (df['lon'] < 100.5)
     ].copy()
-    print(f"Safety Check: Removed {original_count - len(df)} points that were in the wrong city.")
-    
-    # 2. Limit for testing (First 50 points only)
-    # df = df.head(50) 
 
-    print(f"Snapping {len(df)} points...")
+    print(f"Snapping {len(df)} points in Alor Setar...")
     
     snapped_lats = []
     snapped_lons = []
@@ -97,12 +105,10 @@ def snap_data_to_road():
 
     for index, row in df.iterrows():
         lat, lon = row['lat'], row['lon']
-        
-        # OSRM requires LONGITUDE first: "{lon},{lat}"
-        coords = f"{lon},{lat}"
+        coords = f"{lon},{lat}" # Correct OSRM order
         
         try:
-            # increased radius to 1000m to catch remote hotels
+            # Radius 1000m to find nearest road
             url = f"{OSRM_URL}{coords}?number=1&radius=1000"
             response = requests.get(url, timeout=5)
             
@@ -110,27 +116,23 @@ def snap_data_to_road():
                 data = response.json()
                 if data['code'] == 'Ok' and data.get('waypoints'):
                     pt = data['waypoints'][0]['location']
-                    # OSRM returns [lon, lat]
                     snapped_lats.append(pt[1]) 
                     snapped_lons.append(pt[0])
                     road_names.append(data['waypoints'][0]['name'])
                 else:
-                    # Snapping failed (no road found) -> Keep original
                     snapped_lats.append(lat)
                     snapped_lons.append(lon)
                     road_names.append("NO_ROAD_FOUND")
             else:
                 snapped_lats.append(lat)
                 snapped_lons.append(lon)
-                road_names.append(f"API_ERROR_{response.status_code}")
-                
-        except Exception as e:
+                road_names.append("API_ERROR")
+        except:
             snapped_lats.append(lat)
             snapped_lons.append(lon)
             road_names.append("REQ_FAILED")
         
-        # Sleep to avoid getting blocked
-        time.sleep(1.0)
+        time.sleep(1.0) # Be nice to the API
 
     df['snapped_lat'] = snapped_lats
     df['snapped_lon'] = snapped_lons
