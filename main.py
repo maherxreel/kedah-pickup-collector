@@ -47,12 +47,14 @@ def fetch_overture_data():
             ST_Y(geometry) AS lat, 
             ST_X(geometry) AS lon
         FROM read_parquet('s3://overturemaps-us-west-2/release/2025-11-19.0/theme=places/type=place/*', filename=true, hive_partitioning=1)
+       # UPDATED: Strict Alor Setar Box (No Thailand)
         WHERE 
-            bbox.xmin > 100.0 AND bbox.xmax < 101.5
-            AND bbox.ymin > 5.0 AND bbox.ymax < 7.0
+            bbox.xmin > 100.30 AND bbox.xmax < 100.45
+            AND bbox.ymin > 6.05 AND bbox.ymax < 6.20
             AND (
                 categories.primary LIKE '%hotel%' 
                 OR categories.primary LIKE '%transportation%'
+                OR categories.primary LIKE '%shopping%'
             )
     ) TO '{DATA_DIR}/overture_pickups.csv' (HEADER, DELIMITER ',');
     """
