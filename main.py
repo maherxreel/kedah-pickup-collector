@@ -61,7 +61,7 @@ def fetch_overture_data():
             categories.primary AS category, 
             ST_Y(geometry) AS lat, 
             ST_X(geometry) AS lon
-        FROM read_parquet('s3://overturemaps-us-west-2/release/2024-11-13.0/theme=places/type=place/*', filename=true, hive_partitioning=1)
+        FROM read_parquet('s3://overturemaps-us-west-2/release/2025-11-19.0/theme=places/type=place/*', filename=true, hive_partitioning=1)
         WHERE 
             bbox.xmin > 100.3 AND bbox.xmax < 101.1
             AND bbox.ymin > 5.0 AND bbox.ymax < 6.5
