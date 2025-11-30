@@ -8,11 +8,14 @@ import http.server
 import socketserver
 import threading
 import time
-import json
+import googlemaps 
 
 # --- CONFIG ---
 DATA_DIR = "/app/data"
 os.makedirs(DATA_DIR, exist_ok=True)
+
+# YOUR KEY
+GOOGLE_API_KEY = "AIzaSyD_UHEIfFxUSL23EjlQSZEEGt_Znd-1rGg"
 
 # --- PART 1: GOV DATA ---
 def fetch_gov_data():
@@ -40,11 +43,14 @@ def fetch_gov_data():
 def fetch_overture_data():
     print("--- [2/3] Starting Overture Data Fetch ---")
     output_file = f"{DATA_DIR}/overture_pickups.csv"
+    
+    # Self-clean to force fresh start
     if os.path.exists(output_file): os.remove(output_file)
 
     con = duckdb.connect()
     con.execute("INSTALL spatial; LOAD spatial; INSTALL httpfs; LOAD httpfs;")
     
+    # STRICT ALOR SETAR BOX
     query = f"""
     COPY (
         SELECT 
@@ -70,94 +76,75 @@ def fetch_overture_data():
     except Exception as e:
         print(f"Overture Error: {e}")
 
-# --- PART 3: SNAP TO ROAD (VALHALLA EDITION) ---
+# --- PART 3: GOOGLE SNAP TO ROADS ---
 def snap_data_to_road():
-    print("--- [3/3] Starting Road Snapping (Valhalla Mode) ---")
+    print("--- [3/3] Starting Road Snapping (Google Mode) ---")
+    
     input_path = f"{DATA_DIR}/overture_pickups.csv"
     output_path = f"{DATA_DIR}/snapped_pickups.csv"
 
-    if not os.path.exists(input_path): return
+    if not os.path.exists(input_path):
+        print("Input file missing.")
+        return
 
     df = pd.read_csv(input_path)
+    
+    # Filter strict Kedah box just in case
     df = df[
         (df['lat'] > 6.0) & (df['lat'] < 6.25) & 
         (df['lon'] > 100.2) & (df['lon'] < 100.5)
     ].copy()
-
-    print(f"Snapping {len(df)} points using Valhalla...")
     
+    print(f"Snapping {len(df)} points using Google API...")
+
+    gmaps = googlemaps.Client(key=GOOGLE_API_KEY)
+
     snapped_lats = []
     snapped_lons = []
     road_names = []
 
-    # Valhalla Public Demo Server
-    valhalla_url = "https://valhalla1.openstreetmap.de/locate"
-
-    for index, row in df.iterrows():
-        lat, lon = row['lat'], row['lon']
+    # Process in batches of 100 (Google Limit)
+    chunk_size = 100
+    records = df.to_dict('records')
+    
+    for i in range(0, len(records), chunk_size):
+        chunk = records[i:i+chunk_size]
+        path_chunk = [(r['lat'], r['lon']) for r in chunk]
         
         try:
-            # Valhalla expects a JSON payload
-            payload = {
-                "locations": [{"lat": lat, "lon": lon}],
-                "costing": "auto",
-                "radius": 200  # meters
-            }
+            # Call Google API
+            snapped_points = gmaps.snap_to_roads(path_chunk, interpolate=False)
             
-            response = requests.post(valhalla_url, json=payload, timeout=10)
+            # Create a lookup dictionary: {originalIndex: (lat, lon)}
+            snap_map = {}
+            for item in snapped_points:
+                if 'originalIndex' in item and 'location' in item:
+                    snap_map[item['originalIndex']] = (
+                        item['location']['latitude'],
+                        item['location']['longitude']
+                    )
             
-            if response.status_code == 200:
-                data = response.json()
-                # Check for edges (roads)
-                if data and len(data) > 0 and 'edges' in data[0]:
-                    # Valhalla returns the "edge" (road segment). 
-                    # We take the closest point on that edge.
-                    # Note: Valhalla's 'locate' gives us info about the road, but slightly harder to get exact point.
-                    # Simplification: We will trust the first result matches.
-                    
-                    # Wait! Valhalla 'locate' is for map matching. 
-                    # Let's use the standard result.
-                    
-                    edge = data[0]['edges'][0]
-                    # Valhalla doesn't always return the exact snapped coordinate in 'locate' easily 
-                    # without more math, but let's check 'correlated_lat' if available or just use the input
-                    # Actually, Valhalla is tricky for simple snapping.
-                    
-                    # LET'S FALLBACK TO OSRM BUT WITH A PROXY TRICK (HTTPS)
-                    # The issue with OSRM previously might have been HTTP vs HTTPS or strict blocking.
-                    # We will try the HTTPS version of openstreetmap.de which is usually open.
-                    pass
-            
-            # REVISION: Valhalla is too complex for a quick script.
-            # LET'S USE THE "ROBUST" OSRM via HTTPS.
-            # Many cloud servers block HTTP but allow HTTPS.
-            
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            # Note the 's' in https
-            osrm_secure = f"https://routing.openstreetmap.de/routed-car/nearest/v1/driving/{lon},{lat}?number=1&radius=1000"
-            
-            r = requests.get(osrm_secure, headers=headers, timeout=10)
-            if r.status_code == 200:
-                d = r.json()
-                if 'waypoints' in d:
-                    pt = d['waypoints'][0]['location']
-                    snapped_lats.append(pt[1])
-                    snapped_lons.append(pt[0])
-                    road_names.append(d['waypoints'][0].get('name', 'Unnamed Road'))
+            # Map back to original order
+            for j in range(len(chunk)):
+                if j in snap_map:
+                    snapped_lats.append(snap_map[j][0])
+                    snapped_lons.append(snap_map[j][1])
+                    road_names.append("Google_Verified")
                 else:
-                    raise Exception("No Waypoints")
-            else:
-                # If HTTPS fails, we mark as API_ERROR_SECURE
-                snapped_lats.append(lat)
-                snapped_lons.append(lon)
-                road_names.append(f"API_ERROR_{r.status_code}")
-
+                    # No road found near point
+                    snapped_lats.append(chunk[j]['lat'])
+                    snapped_lons.append(chunk[j]['lon'])
+                    road_names.append("No_Road_Nearby")
+                    
         except Exception as e:
-            snapped_lats.append(lat)
-            snapped_lons.append(lon)
-            road_names.append("REQ_FAILED")
+            print(f"Google Batch Error: {e}")
+            # If batch fails, preserve originals
+            for r in chunk:
+                snapped_lats.append(r['lat'])
+                snapped_lons.append(r['lon'])
+                road_names.append("Google_Error")
         
-        time.sleep(2.0) # Slower rate limit
+        time.sleep(0.5) # Gentle rate limit
 
     df['snapped_lat'] = snapped_lats
     df['snapped_lon'] = snapped_lons
